@@ -255,24 +255,34 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         )
         k_nope = kv[..., : layer.qk_nope_head_dim]
         v_bf16 = kv[..., layer.qk_nope_head_dim :]
-        q_nope = q[..., : layer.qk_nope_head_dim]
+        enable_pdl = is_arch_support_pdl()
 
-        q_fp8, k_fp8 = self._fused_rope_fp8_quantize(
-            q_nope=q_nope,
-            q_pe=q_pe,
-            k_nope=k_nope,
-            k_pe=k_pe,
-            cos_sin_cache=layer.rotary_emb.cos_sin_cache,
-            positions=positions,
-            is_neox=getattr(layer.rotary_emb, "is_neox_style", True),
-            qk_nope_head_dim=layer.qk_nope_head_dim,
-            qk_rope_head_dim=layer.qk_rope_head_dim,
-        )
-        v_fp8 = fp8_quantize(v_bf16, enable_pdl=is_arch_support_pdl())
+        if layer.rotary_emb is None:
+            # NoPE layer (``skip_rope``, e.g. Kimi Linear's MLA layers). With
+            # no rotation ``q`` already is the packed ``[nope | pe]`` tensor
+            # (``q_pe`` is its trailing view), so quantize it as-is, and pack
+            # K / quantize V with the same fused kernel prefix chunks use.
+            q_fp8 = fp8_quantize(q, enable_pdl=enable_pdl)
+            k_fp8, v_fp8 = mla_kv_pack_quantize_fp8(
+                k_nope, k_pe, v_bf16, enable_pdl=enable_pdl
+            )
+        else:
+            q_fp8, k_fp8 = self._fused_rope_fp8_quantize(
+                q_nope=q[..., : layer.qk_nope_head_dim],
+                q_pe=q_pe,
+                k_nope=k_nope,
+                k_pe=k_pe,
+                cos_sin_cache=layer.rotary_emb.cos_sin_cache,
+                positions=positions,
+                is_neox=getattr(layer.rotary_emb, "is_neox_style", True),
+                qk_nope_head_dim=layer.qk_nope_head_dim,
+                qk_rope_head_dim=layer.qk_rope_head_dim,
+            )
+            v_fp8 = fp8_quantize(v_bf16, enable_pdl=enable_pdl)
 
         # k_pe is shared across heads (RoPE is position-only), so head 0
         # reproduces the original [tokens, 1, qk_rope] latent layout.
-        kv_a_fp8 = fp8_quantize(kv_a, enable_pdl=is_arch_support_pdl())
+        kv_a_fp8 = fp8_quantize(kv_a, enable_pdl=enable_pdl)
         k_pe_fp8 = k_fp8[:, 0:1, layer.qk_nope_head_dim :]
         self.token_to_kv_pool.set_mla_kv_buffer(
             layer.attn_mha,
