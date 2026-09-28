@@ -44,7 +44,11 @@ elif _is_mps:
 
     apply_metal_profiler_patches()
 
+from sglang.srt.utils import is_xpu
+
 logger = logging.getLogger(__name__)
+
+_is_xpu = is_xpu()
 
 
 @dataclass(kw_only=True)
@@ -182,6 +186,13 @@ class SchedulerProfilerManager:
                 )
         if hasattr(torch.profiler.ProfilerActivity, "XPU"):
             activity_map["XPU"] = torch.profiler.ProfilerActivity.XPU
+            if _is_xpu:
+                activity_map["GPU"] = torch.profiler.ProfilerActivity.XPU
+                logger.warning(
+                    "torch profiler: XPU arm SERVED, GPU -> ProfilerActivity.XPU "
+                    "(CUDA collects no device events here, so GPU would trace "
+                    "host API calls only)"
+                )
         torchprof_activities = [
             activity_map[a] for a in activities if a in activity_map
         ]
