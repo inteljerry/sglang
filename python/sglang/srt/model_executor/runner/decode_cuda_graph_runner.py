@@ -582,6 +582,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.replace_embeds is not None:
             return False
 
+        # A captured graph bakes the attention backend's MAX_SEQ_LEN_FOR_CAPTURE
+        # into its buffer widths. When a backend caps that to a tier, a longer
+        # batch must not replay the graph -- it would read a page table narrower
+        # than its own sequence. Decline, and let the eager path size itself.
+        _seq_cap = getattr(self.model_runner.attn_backend, "capture_seq_len_cap", None)
+        if _seq_cap is not None:
+            _seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+            if _seq_lens_cpu is None or int(_seq_lens_cpu.max()) > _seq_cap:
+                return False
+
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode

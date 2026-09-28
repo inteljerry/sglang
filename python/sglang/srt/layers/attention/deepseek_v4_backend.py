@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -521,6 +522,26 @@ class DeepseekV4AttnBackend(
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
+        self.capture_seq_len_cap = None
+        _cap = int(os.environ.get("SGLANG_XPU_CAPTURE_SEQ_LEN", "0") or 0)
+        if _cap and _cap < self.MAX_SEQ_LEN_FOR_CAPTURE:
+            self.capture_seq_len_cap = _cap
+            logger.warning(
+                "DSV4 capture seq tier: XPU arm SERVED, MAX_SEQ_LEN_FOR_CAPTURE "
+                "%d -> %d. The indexer sizes its paged gather and its logits "
+                "buffer from this, so it is the decode cost. Batches whose "
+                "longest sequence exceeds the tier DECLINE the captured graph "
+                "and run eager, which is slower but correct.",
+                self.MAX_SEQ_LEN_FOR_CAPTURE,
+                _cap,
+            )
+            self.MAX_SEQ_LEN_FOR_CAPTURE = _cap
+        else:
+            logger.warning(
+                "DSV4 capture seq tier: DECLINED (SGLANG_XPU_CAPTURE_SEQ_LEN "
+                "unset or >= context); capturing at the full %d",
+                self.MAX_SEQ_LEN_FOR_CAPTURE,
+            )
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.c4_topk = getattr(
