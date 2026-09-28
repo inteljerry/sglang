@@ -1673,21 +1673,69 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
 
             if self.is_fp4_expert and self.dequant_fp4_to_fp8:
+                # Memory note: the naive version of this loop (append every
+                # per-expert dequantized tensor to a Python list, then
+                # torch.stack the whole list) keeps the original fp4 tensor,
+                # all 256 loose fp8 tensors, AND the final stacked fp8 tensor
+                # alive on-device simultaneously at peak (~5x the fp4
+                # footprint) -- verified to OOM a 32GB XPU card for this
+                # model (UR_RESULT_ERROR_OUT_OF_RESOURCES at the old
+                # torch.stack call). A version that pre-allocates the
+                # destination on-device and copies each expert in-place
+                # (measured on real hardware, this session) drops peak to
+                # ~3x but *still* OOMs -- short by only ~250-500MiB of 32GiB
+                # per GPU (torch.OutOfMemoryError, not fragmentation --
+                # empty_cache() before the allocation made no difference).
+                # The original (fp4, ~1x) and the full destination (fp8,
+                # ~2x) are both needed on-device simultaneously only because
+                # the destination is materialized on the GPU while the
+                # original is still being read. Staging the destination on
+                # host RAM instead (abundant on this host) during the
+                # compute loop, then freeing the on-device original before
+                # moving the completed destination back to GPU, drops
+                # on-device peak to ~2x (never needing original + full
+                # destination on-device at the same time). Same dequant
+                # math as before -- only *where* intermediate results live
+                # changes.
                 for weight_param, scale_param in [
                     (layer.w13_weight, layer.w13_weight_scale_inv),
                     (layer.w2_weight, layer.w2_weight_scale_inv),
                 ]:
                     num_experts = weight_param.shape[0]
-                    new_weights = []
-                    new_scales = []
+                    device = weight_param.data.device
+                    new_weight_host = None
+                    new_scale_host = None
                     for e in range(num_experts):
                         w, s = cast_e2m1fn_to_e4m3fn(
                             weight_param.data[e], scale_param.data[e]
                         )
-                        new_weights.append(w)
-                        new_scales.append(s)
-                    weight_param.data = torch.stack(new_weights)
-                    scale_param.data = torch.stack(new_scales).float()
+                        if new_weight_host is None:
+                            new_weight_host = torch.empty(
+                                (num_experts, *w.shape),
+                                dtype=w.dtype,
+                                device="cpu",
+                            )
+                            new_scale_host = torch.empty(
+                                (num_experts, *s.shape),
+                                dtype=torch.float32,
+                                device="cpu",
+                            )
+                        new_weight_host[e].copy_(w, non_blocking=False)
+                        new_scale_host[e].copy_(s, non_blocking=False)
+                        del w, s
+                    # Drop the on-device original before bringing the
+                    # completed destination back -- this is the step that
+                    # ensures original and destination are never both
+                    # resident on-device at once.
+                    weight_param.data = torch.empty(0, device=device)
+                    scale_param.data = torch.empty(0, device=device)
+                    if _is_xpu:
+                        torch.xpu.empty_cache()
+                    weight_param.data = new_weight_host.to(device, non_blocking=False)
+                    scale_param.data = new_scale_host.to(device, non_blocking=False)
+                    del new_weight_host, new_scale_host
+                    if _is_xpu:
+                        torch.xpu.empty_cache()
                     scale_param.format_ue8m0 = False
                 self.is_fp4_expert = False
                 logger.warning_once("Dequantized FP4 expert weights to FP8.")
