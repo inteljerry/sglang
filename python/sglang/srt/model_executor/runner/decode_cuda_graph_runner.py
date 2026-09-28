@@ -187,6 +187,20 @@ def build_replay_fb_view(
     )
 
 
+
+def _compose_variant(variant_label, tier):
+    """Fold the captured sequence width into ShapeKey.variant_label.
+
+    ShapeKey identifies a captured graph by (size, stream_idx, variant_label).
+    Without the width in there, a bs=8 graph captured at 16k and one captured at
+    512k are the same key, and a long request would replay the narrow graph:
+    stale page-table reads, wrong tokens, no crash.
+    """
+    if tier is None:
+        return variant_label
+    return f"{variant_label}|seq{tier}" if variant_label else f"seq{tier}"
+
+
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """Decode-phase CUDA graph runner.
 
@@ -492,6 +506,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return torch.int64
 
     def _make_graph_key(self, size, stream_idx=None, variant_label=None):
+        variant_label = _compose_variant(
+            variant_label, getattr(self, "_active_seq_tier", None)
+        )
         return ShapeKey(
             size=size,
             stream_idx=stream_idx,
@@ -583,14 +600,32 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         # A captured graph bakes the attention backend's MAX_SEQ_LEN_FOR_CAPTURE
-        # into its buffer widths. When a backend caps that to a tier, a longer
-        # batch must not replay the graph -- it would read a page table narrower
-        # than its own sequence. Decline, and let the eager path size itself.
-        _seq_cap = getattr(self.model_runner.attn_backend, "capture_seq_len_cap", None)
-        if _seq_cap is not None:
+        # into its buffer widths, so a batch may only replay a graph at least as
+        # wide as its own longest sequence. With several widths captured, pick
+        # the SMALLEST that fits rather than declining: that is what removes the
+        # cliff a single tier creates (23.9 -> 16.0 tok/s at the boundary) while
+        # still not making short requests pay full-context work.
+        #
+        # The chosen tier is published to the backend here because it forms part
+        # of the metadata key, and it is folded into the graph key below so a
+        # 16k graph and a 512k graph at the same batch size stay distinct.
+        _backend = self.model_runner.attn_backend
+        self._active_seq_tier = None
+        if hasattr(_backend, "select_capture_tier"):
             _seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
-            if _seq_lens_cpu is None or int(_seq_lens_cpu.max()) > _seq_cap:
+            if _seq_lens_cpu is None:
                 return False
+            _tier = _backend.select_capture_tier(int(_seq_lens_cpu.max()))
+            if _tier is None:
+                return False
+            _backend.set_active_capture_tier(_tier)
+            self._active_seq_tier = _tier
+        else:
+            _seq_cap = getattr(_backend, "capture_seq_len_cap", None)
+            if _seq_cap is not None:
+                _seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+                if _seq_lens_cpu is None or int(_seq_lens_cpu.max()) > _seq_cap:
+                    return False
 
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
@@ -955,6 +990,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if getattr(self, "record_nolora_graph", False)
             else [(None, None)]
         )
+        # One graph per (batch size, captured width). Backends without tiers
+        # yield a single None and behave exactly as before.
+        _seq_tiers = getattr(
+            self.model_runner.attn_backend, "capture_seq_tiers", None
+        ) or [None]
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
@@ -966,15 +1006,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
 
-            for variant_label, _variant_has_lora in lora_variants:
-                _set_capture_lora_variant(variant_label)
-                with torch_compile_decoration.patch_model(
-                    self.model_runner.model,
-                    bs in self.compile_bs,
-                    num_tokens=bs * self.captured_req_width,
-                    tp_group=self.model_runner.tp_group,
-                ) as forward:
-                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
+            for _tier in _seq_tiers:
+                if _tier is not None:
+                    self.model_runner.attn_backend.set_active_capture_tier(_tier)
+                for _lora_label, _variant_has_lora in lora_variants:
+                    variant_label = _compose_variant(_lora_label, _tier)
+                    _set_capture_lora_variant(variant_label)
+                    with torch_compile_decoration.patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs,
+                        num_tokens=bs * self.captured_req_width,
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        self.capture_one_shape(
+                            bs, forward, stream_idx, variant_label
+                        )
 
     def capture_one_shape(
         self,

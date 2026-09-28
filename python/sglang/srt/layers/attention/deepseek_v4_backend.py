@@ -521,27 +521,27 @@ class DeepseekV4AttnBackend(
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
-        self.capture_seq_len_cap = None
-        _cap = int(os.environ.get("SGLANG_XPU_CAPTURE_SEQ_LEN", "0") or 0)
-        if _cap and _cap < self.MAX_SEQ_LEN_FOR_CAPTURE:
-            self.capture_seq_len_cap = _cap
-            logger.warning(
-                "DSV4 capture seq tier: XPU arm SERVED, MAX_SEQ_LEN_FOR_CAPTURE "
-                "%d -> %d. The indexer sizes its paged gather and its logits "
-                "buffer from this, so it is the decode cost. Batches whose "
-                "longest sequence exceeds the tier DECLINE the captured graph "
-                "and run eager, which is slower but correct.",
-                self.MAX_SEQ_LEN_FOR_CAPTURE,
-                _cap,
-            )
-            self.MAX_SEQ_LEN_FOR_CAPTURE = _cap
-        else:
-            logger.warning(
-                "DSV4 capture seq tier: DECLINED (SGLANG_XPU_CAPTURE_SEQ_LEN "
-                "unset or >= context); capturing at the full %d",
-                self.MAX_SEQ_LEN_FOR_CAPTURE,
-            )
+        self._full_seq_len = self.req_to_token.shape[1]
+        self.capture_seq_tiers = self._resolve_capture_tiers()
+        # Width of the graph currently being captured or replayed.
+        # MAX_SEQ_LEN_FOR_CAPTURE is a property over this, so every existing
+        # consumer of that name follows the active tier unchanged.
+        self._active_capture_tier = self.capture_seq_tiers[-1]
+        # Kept for the fix-13 gate in decode_cuda_graph_runner.
+        self.capture_seq_len_cap = (
+            self.capture_seq_tiers[-1]
+            if self.capture_seq_tiers[-1] < self._full_seq_len
+            else None
+        )
+        logger.warning(
+            "DSV4 capture seq tiers: XPU arm SERVED, full context %d, tiers %s "
+            "(from %s). Each decode batch replays the smallest tier that fits "
+            "it; the last tier is the full context so nothing the server "
+            "accepts falls off the graph path.",
+            self._full_seq_len,
+            self.capture_seq_tiers,
+            self._tier_source,
+        )
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.c4_topk = getattr(
@@ -592,6 +592,92 @@ class DeepseekV4AttnBackend(
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
+
+
+
+    # ---- multi-tier graph capture -------------------------------------
+    #
+    # The indexer sizes its paged gather and its logits buffer from
+    # MAX_SEQ_LEN_FOR_CAPTURE, and under graph capture that shape is FROZEN.
+    # One tier is therefore a straight trade: capture at the full context and
+    # every short request pays full-context work (52.41 ms against 27.69 at a
+    # 1M configuration); capture narrow and anything longer falls off the graph
+    # to eager (23.9 -> 16.0 tok/s measured at the 163840 boundary).
+    #
+    # Capturing several widths removes the trade -- each request replays the
+    # smallest graph that fits. Capture costs ~0.02 GB per rank for six graphs,
+    # so this is bounded by capture TIME, not memory. (`cuda_graph={decode=...}`
+    # in the startup line is SECONDS; reading it as gigabytes is what made this
+    # look expensive.)
+    #
+    #   SGLANG_XPU_CAPTURE_SEQ_TIERS=8192,32768,131072,524288
+    #   SGLANG_XPU_CAPTURE_SEQ_LEN=163840          (legacy, single tier)
+
+    # Default ladder, used when nothing is configured. Multi-tier must be the
+    # DEFAULT behaviour, not an opt-in: an operator who sets no environment
+    # variable would otherwise get a single full-context tier, which makes every
+    # short request pay full-context work (52.41 ms against 27.69 at 1M) -- the
+    # exact problem tiering exists to remove, silently reintroduced.
+    _TIER_BASE = 8192
+    _TIER_STEP = 4
+
+    def _resolve_capture_tiers(self) -> List[int]:
+        full = self._full_seq_len
+        raw = os.environ.get("SGLANG_XPU_CAPTURE_SEQ_TIERS", "").strip()
+        source = "SGLANG_XPU_CAPTURE_SEQ_TIERS"
+        if not raw:
+            legacy = int(os.environ.get("SGLANG_XPU_CAPTURE_SEQ_LEN", "0") or 0)
+            if legacy:
+                raw, source = str(legacy), "SGLANG_XPU_CAPTURE_SEQ_LEN (legacy)"
+        if not raw:
+            # Geometric ladder over the configured context: 8k, 32k, 128k, ...
+            # Each step is 4x, so the worst case is a request replaying a graph
+            # 4x wider than it needs, and the count stays small (capture time is
+            # the cost, ~7 s per tier per batch size).
+            # full is context_len plus a small pad (262144 -> 262148), so a
+            # rung just under it would duplicate the final tier for nothing.
+            # Stop once the next rung is within a step of the top.
+            ladder, rung = [], self._TIER_BASE
+            while rung * self._TIER_STEP < full:
+                ladder.append(rung)
+                rung *= self._TIER_STEP
+            raw, source = ",".join(str(x) for x in ladder), "derived from context"
+        tiers = sorted(
+            {
+                t
+                for t in (int(x) for x in raw.replace(" ", "").split(",") if x)
+                if 0 < t < full
+            }
+        )
+        # The full context is always the last tier, so nothing the server will
+        # accept can fall off the graph path.
+        tiers.append(full)
+        self._tier_source = source
+        return tiers
+
+    @property
+    def MAX_SEQ_LEN_FOR_CAPTURE(self) -> int:
+        return self._active_capture_tier
+
+    def set_active_capture_tier(self, tier: int) -> None:
+        """Select which captured width the next capture or replay refers to.
+
+        Must agree with the tier baked into the graph being replayed, which is
+        why the tier is part of the metadata key: a mismatch replays buffers
+        narrower than the sequence and reads stale page-table entries. That is
+        wrong tokens, not a crash.
+        """
+        assert (
+            tier in self.capture_seq_tiers
+        ), f"tier {tier} was never captured; have {self.capture_seq_tiers}"
+        self._active_capture_tier = tier
+
+    def select_capture_tier(self, max_seq_len: int) -> Optional[int]:
+        """Smallest captured tier that fits, or None meaning: run eager."""
+        for tier in self.capture_seq_tiers:
+            if max_seq_len <= tier:
+                return tier
+        return None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1242,7 +1328,9 @@ class DeepseekV4AttnBackend(
             actual_max_seq_len = seq_lens_cpu.max().item()
             assert actual_max_seq_len <= chosen_max_seq_len
 
-        graph_key = bs
+        # (bs, tier): same batch size at a different captured width is a
+        # DIFFERENT graph and must not share metadata.
+        graph_key = (bs, self._active_capture_tier)
         if bucket == _GraphBucket.DECODE_OR_IDLE:
             assert out_cache_loc is not None
             assert len(out_cache_loc.shape) == 1, f"{out_cache_loc.shape=}"
