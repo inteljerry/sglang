@@ -112,8 +112,32 @@ def hpc_bf16xfp32_gemm_enabled() -> bool:
     return _linear_bf16_fp32_algo == "hpc" and _hpc_gemm_bf16xfp32_available()
 
 
+@functools.cache
+def _mm_out_dtype_supported(device_type: str) -> bool:
+    """Whether torch.mm(bf16, bf16, out_dtype=fp32) is registered for this
+    backend (aten::mm.dtype is per-backend; XPU has it from torch 2.13+xpu).
+    Probed once so an older wheel keeps the fp32 fallback instead of raising."""
+    if device_type == "cuda":
+        return True
+    if device_type != "xpu":
+        return False
+    try:
+        a = torch.ones(1, 1, dtype=torch.bfloat16, device=device_type)
+        return torch.mm(a, a, out_dtype=torch.float32).dtype == torch.float32
+    except (RuntimeError, NotImplementedError, TypeError):
+        return False
+
+
 def _linear_bf16_fp32_cublas(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    if x.is_cuda and x.dtype == torch.bfloat16 and y.dtype == torch.bfloat16:
+    # Without the out_dtype branch the fallback below re-materializes the bf16
+    # weight in fp32 on every call. For the DSv4 compressor wkv_gate (bf16
+    # (2048, 4096) in CSA layers) that is a 32 MiB fp32 copy plus a 4x larger
+    # weight read per layer per decode step.
+    if (
+        x.dtype == torch.bfloat16
+        and y.dtype == torch.bfloat16
+        and _mm_out_dtype_supported(x.device.type)
+    ):
         return torch.mm(x, y.t(), out_dtype=torch.float32)
     return torch.mm(x.float(), y.float().t())
 
