@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import partial
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -62,6 +63,126 @@ IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
 
 _arange_cache = {}
+
+
+# Rows per block of the XPU C4 indexer are a multiple of this.
+_C4_INDEXER_ROW_ALIGN = 64
+
+
+def _c4_indexer_min_rows(pages: int) -> int:
+    """Fewest rows of a block that keep PAGES_PER_PROG of the logits kernel at 32.
+
+    _pages_per_prog in sgl_kernel/fp8_paged_mqa_logits.py picks 32 only while
+    rows x pages >= 65,536. PAGES_PER_PROG is a tl.constexpr, so a smaller value is
+    another kernel variant, which Triton compiles at its first call. The count is
+    rounded up to a multiple of _C4_INDEXER_ROW_ALIGN.
+    """
+    rows = -(-65536 // max(1, pages))
+    return -(-rows // _C4_INDEXER_ROW_ALIGN) * _C4_INDEXER_ROW_ALIGN
+
+
+def _c4_indexer_row_block(
+    *, query_rows: int, max_seq_len: int, pages: int, budget_bytes: int
+) -> Optional[int]:
+    """Rows per block for the XPU C4 indexer, or None when all rows run at once.
+
+    The logits kernel allocates fp32 logits of query_rows x max_seq_len. One
+    8,192-row prefill chunk at 64,512 C4 entries is 1.97 GiB, and each further chunk
+    adds 2,048 entries, which is 64 MiB. Row blocks keep each allocation near the
+    budget. Every block keeps max_seq_len, and every block but the last has
+    row_block rows, a multiple of _C4_INDEXER_ROW_ALIGN. No block has fewer rows
+    than _c4_indexer_min_rows(pages), where pages is the count that the kernel
+    computes. So every block keeps the 32-page programs of one call over all rows.
+    The budget is a target: _c4_indexer_blocked adds a tail shorter than the floor
+    to the block before it, so one call allocates fewer than
+    (row_block + floor) x max_seq_len x 4 bytes.
+    """
+    if budget_bytes <= 0 or query_rows * max_seq_len * 4 <= budget_bytes:
+        return None
+    align = _C4_INDEXER_ROW_ALIGN
+    budget_rows = budget_bytes // (max_seq_len * 4) // align * align
+    rows = max(_c4_indexer_min_rows(pages), budget_rows)
+    return rows if rows < query_rows else None
+
+
+def _c4_indexer_blocked(
+    *,
+    logits_fn: Callable[..., torch.Tensor],
+    topk_fn: Callable[[torch.Tensor, int, int], None],
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens_2d: torch.Tensor,
+    page_table: torch.Tensor,
+    metadata: object,
+    max_seq_len: int,
+    query_rows: int,
+    row_block: int,
+    min_rows: int,
+) -> None:
+    """Logits and top-k for rows [r0, r1) at a time.
+
+    topk_fn(logits, r0, r1) writes the output rows of the block. A tail shorter than
+    min_rows joins the block before it, so every block keeps the 32-page programs of
+    the kernel.
+    """
+    r0 = 0
+    while r0 < query_rows:
+        r1 = min(r0 + row_block, query_rows)
+        if query_rows - r1 < min_rows:
+            r1 = query_rows
+        block_logits = logits_fn(
+            q[r0:r1],
+            kv_cache,
+            weights[r0:r1],
+            seq_lens_2d[r0:r1],
+            page_table[r0:r1],
+            metadata,
+            max_seq_len,
+            False,
+        )
+        topk_fn(block_logits, r0, r1)
+        del block_logits
+        r0 = r1
+
+
+def _c4_indexer_topk_rows(
+    scores: torch.Tensor,
+    r0: int,
+    r1: int,
+    *,
+    c4_seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    c4_sparse_page_indices: torch.Tensor,
+    page_size: int,
+    topk_metadata: object,
+    raw_indices: Optional[torch.Tensor],
+    use_v2: bool,
+) -> None:
+    """Top-k of the logits of rows [r0, r1), written to the same rows of the output.
+
+    The blocks share topk_metadata. The XPU top-k (topk_transform_512_v2_interface
+    in sgl-kernel-xpu) does not read it.
+    """
+    rows = slice(r0, r1)
+    if use_v2:
+        topk_transform_512_v2(
+            scores,
+            c4_seq_lens[rows],
+            page_table[rows],
+            c4_sparse_page_indices[rows],
+            page_size,
+            topk_metadata,
+        )
+    else:
+        topk_transform_512(
+            scores,
+            c4_seq_lens[rows],
+            page_table[rows],
+            c4_sparse_page_indices[rows],
+            page_size,
+            None if raw_indices is None else raw_indices[rows],
+        )
 
 
 def fp8_paged_mqa_logits_torch(
@@ -406,6 +527,9 @@ class C4IndexerBackendMixin:
         super().__init__()
         self.debug_use_external_c4_sparse_indices: bool = False
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
+        self.xpu_indexer_logits_budget_bytes: int = (
+            envs.SGLANG_OPT_XPU_INDEXER_LOGITS_BUDGET_MB.get() << 20
+        )
 
     def _forward_prepare_multi_stream(
         self,
@@ -630,6 +754,45 @@ class C4IndexerBackendMixin:
             max_seqlen_k=plan.max_seqlen_k,
         )
 
+    def _get_xpu_indexer_row_blocks(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        indexer_metadata: PagedIndexerMetadata,
+        page_table: torch.Tensor,
+        query_rows: int,
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """(row_block, min_rows) for a paged XPU Triton logits call, or (None, None).
+
+        Only prefill (EXTEND and MIXED batches) runs in row blocks, outside a graph
+        and with the kernel top-k. Decode, speculative verify and graphs keep the
+        single call.
+        """
+        if (
+            forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            or indexer_metadata.use_prefill_cuda_graph
+            or is_in_tc_piecewise_cuda_graph()
+            or is_in_breakable_cuda_graph()
+            or envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
+            or self.dsa_topk_backend.is_torch()
+            or self.dsa_topk_backend.is_flashinfer()
+        ):
+            return None, None
+        max_seq_len = indexer_metadata.max_c4_seq_len
+        # pages as the logits kernel counts them (num_pages_req)
+        pages = min(
+            page_table.shape[1], -(-max_seq_len // indexer_metadata.c4_page_size)
+        )
+        row_block = _c4_indexer_row_block(
+            query_rows=query_rows,
+            max_seq_len=max_seq_len,
+            pages=pages,
+            budget_bytes=self.xpu_indexer_logits_budget_bytes,
+        )
+        if row_block is None:
+            return None, None
+        return row_block, _c4_indexer_min_rows(pages)
+
     def forward_c4_indexer(
         self,
         x: torch.Tensor,
@@ -686,6 +849,7 @@ class C4IndexerBackendMixin:
             )
 
         use_fp4_indexer = c4_indexer.use_fp4_indexer
+        blockable = False
 
         if use_fp4_indexer:
             q_fp4, q_sf = q_indexer
@@ -715,7 +879,10 @@ class C4IndexerBackendMixin:
             else:
                 fn = fp8_paged_mqa_logits_torch
         elif is_xpu():
-            if envs.SGLANG_FP8_PAGED_MQA_XPU_KERNEL.get():
+            use_xpu_kernel = envs.SGLANG_FP8_PAGED_MQA_XPU_KERNEL.get()
+            # Row blocks are tested with the Triton logits kernel only.
+            blockable = not use_xpu_kernel
+            if use_xpu_kernel:
                 from sgl_kernel import fp8_paged_mqa_logits
                 fn = fp8_paged_mqa_logits
             else:
@@ -754,6 +921,15 @@ class C4IndexerBackendMixin:
             c4_seq_lens=c4_seq_lens,
             query_rows=query_rows,
         )
+        row_block = min_rows = None
+        if blockable and nonpaged_plan is None:
+            row_block, min_rows = self._get_xpu_indexer_row_blocks(
+                forward_batch=forward_batch,
+                indexer_metadata=indexer_metadata,
+                page_table=page_table,
+                query_rows=query_rows,
+            )
+        logits = None
         if nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
             logits = self._forward_nonpaged_indexer(
@@ -772,16 +948,17 @@ class C4IndexerBackendMixin:
             c4_indexer_kv_cache = c4_indexer_kv_cache.view(
                 c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
             )
-            logits = fn(
-                q,
-                c4_indexer_kv_cache,
-                weights,
-                _c4sl,
-                page_table,
-                indexer_metadata.deep_gemm_metadata,
-                indexer_metadata.max_c4_seq_len,
-                False,
-            )
+            if row_block is None:
+                logits = fn(
+                    q,
+                    c4_indexer_kv_cache,
+                    weights,
+                    _c4sl,
+                    page_table,
+                    indexer_metadata.deep_gemm_metadata,
+                    indexer_metadata.max_c4_seq_len,
+                    False,
+                )
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
@@ -805,7 +982,31 @@ class C4IndexerBackendMixin:
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
-        if (
+        if row_block is not None:
+            _c4_indexer_blocked(
+                logits_fn=fn,
+                topk_fn=partial(
+                    _c4_indexer_topk_rows,
+                    c4_seq_lens=c4_seq_lens,
+                    page_table=page_table,
+                    c4_sparse_page_indices=c4_sparse_page_indices,
+                    page_size=indexer_metadata.c4_page_size,
+                    topk_metadata=indexer_metadata.topk_metadata,
+                    raw_indices=raw_indices,
+                    use_v2=envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None,
+                ),
+                q=q,
+                kv_cache=c4_indexer_kv_cache,
+                weights=weights,
+                seq_lens_2d=_c4sl,
+                page_table=page_table,
+                metadata=indexer_metadata.deep_gemm_metadata,
+                max_seq_len=indexer_metadata.max_c4_seq_len,
+                query_rows=query_rows,
+                row_block=row_block,
+                min_rows=min_rows,
+            )
+        elif (
             envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
             or self.dsa_topk_backend.is_torch()
         ):
