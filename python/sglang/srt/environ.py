@@ -1195,6 +1195,10 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_XPU_KERNEL = EnvBool(False)
+    # XPU. Target size (MiB) of one fp32 logits block of the C4 indexer in prefill.
+    # A larger call runs in row blocks. The row floor and a merged tail can exceed
+    # the target. 0 disables the blocks.
+    SGLANG_OPT_XPU_INDEXER_LOGITS_BUDGET_MB = EnvInt(128)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.
