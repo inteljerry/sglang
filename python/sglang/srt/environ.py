@@ -1176,6 +1176,11 @@ class Envs:
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
+    # XPU: MXFP4 MoE decode batches of up to SGLANG_OPT_XPU_MOE_DECODE_GEMV_MAX_TOKENS
+    # tokens run sgl_kernel.moe_w4a16_decode_gemv instead of fused_experts, when
+    # sgl_kernel has that op.
+    SGLANG_OPT_XPU_MOE_DECODE_GEMV = EnvBool(False)
+    SGLANG_OPT_XPU_MOE_DECODE_GEMV_MAX_TOKENS = EnvInt(8)
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
