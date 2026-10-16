@@ -718,6 +718,10 @@ class C4IndexerBackendMixin:
             if envs.SGLANG_FP8_PAGED_MQA_XPU_KERNEL.get():
                 from sgl_kernel import fp8_paged_mqa_logits
                 fn = fp8_paged_mqa_logits
+            elif envs.SGLANG_OPT_XPU_INDEXER_EARLY_EXIT.get():
+                from sglang.kernels.ops.attention.dsv4.xpu_paged_mqa_logits import (
+                    fp8_paged_mqa_logits_triton_early_exit as fn,
+                )
             else:
                 from sgl_kernel import fp8_paged_mqa_logits_triton
                 fn = fp8_paged_mqa_logits_triton
