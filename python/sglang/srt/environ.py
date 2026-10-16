@@ -1190,6 +1190,10 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_DSV4_MHC_PREWARM = EnvBool(True)
+    # XPU, DeepSeek V4: at start-up, launch once every specialization of the indexer
+    # logits, allocator, page-table and index-combine Triton kernels that the server
+    # can reach, before the decode graphs are captured.
+    SGLANG_OPT_XPU_TRITON_PREWARM = EnvBool(False)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
