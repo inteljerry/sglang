@@ -33,7 +33,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
@@ -632,7 +632,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"layers=[{kvc.layer_info.start_layer},{kvc.layer_info.end_layer}) "
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
-        self.swa_page_size = cfg.window_size
+        # The C4 state ring is addressed per SWA page (swa_page x ring_size +
+        # swa_loc % ring_size in the compressor), and the SWA pool pages by
+        # page_size (kv_cache_configurator), not by the model's sliding window.
+        self.swa_page_size = get_schedule().page_size
         self.swa_ratio = kvc.server_args.swa_full_tokens_ratio
         self.is_speculative = kvc.server_args.speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = (
