@@ -175,6 +175,41 @@ class MhcOps(NamedTuple):
     fused_hc_head: Optional[Callable[..., Any]]
 
 
+# XPU: when SGLANG_OPT_XPU_MHC_SMALL_T is on and sgl_kernel exports
+# mhc_fused_post_pre_small_t, calls with 1 to this many tokens run that op.
+# Other token counts keep mhc_fused_post_pre.
+_XPU_MHC_SMALL_T_MAX_TOKENS = 8
+
+
+def _xpu_small_t_mhc_fused_post_pre(
+    mhc_fused_post_pre: Callable[..., Any],
+) -> Callable[..., Any]:
+    """mhc_fused_post_pre that runs the small-T op for 1 to 8 tokens.
+
+    The op comes back unchanged when sgl_kernel has no mhc_fused_post_pre_small_t.
+    """
+    try:
+        from sgl_kernel import mhc_fused_post_pre_small_t
+    except ImportError:
+        logger.warning(
+            "SGLANG_OPT_XPU_MHC_SMALL_T is set, but sgl_kernel has no "
+            "mhc_fused_post_pre_small_t. mhc_fused_post_pre runs for every call."
+        )
+        return mhc_fused_post_pre
+    logger.info(
+        "SGLANG_OPT_XPU_MHC_SMALL_T: mhc_fused_post_pre_small_t runs "
+        "for 1 to %d tokens",
+        _XPU_MHC_SMALL_T_MAX_TOKENS,
+    )
+
+    def fused_post_pre(x: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+        if 0 < x.shape[0] <= _XPU_MHC_SMALL_T_MAX_TOKENS:
+            return mhc_fused_post_pre_small_t(x, *args, **kwargs)
+        return mhc_fused_post_pre(x, *args, **kwargs)
+
+    return fused_post_pre
+
+
 @functools.cache
 def _get_mhc_ops() -> MhcOps:
     """Load MHC kernels only when a DeepSeek-V4 layer needs them.
@@ -193,6 +228,9 @@ def _get_mhc_ops() -> MhcOps:
             mhc_fused_post_pre,
             mhc_pre,
         )
+
+        if envs.SGLANG_OPT_XPU_MHC_SMALL_T.get():
+            mhc_fused_post_pre = _xpu_small_t_mhc_fused_post_pre(mhc_fused_post_pre)
 
         return MhcOps(
             hc_split_sinkhorn,
