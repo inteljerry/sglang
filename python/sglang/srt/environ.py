@@ -1192,6 +1192,9 @@ class Envs:
     SGLANG_DSV4_MHC_PREWARM = EnvBool(True)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
+    # XPU, DeepSeek V4: mhc_fused_post_pre calls with 1 to 8 tokens run
+    # mhc_fused_post_pre_small_t when sgl_kernel has that op.
+    SGLANG_OPT_XPU_MHC_SMALL_T = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_XPU_KERNEL = EnvBool(False)
