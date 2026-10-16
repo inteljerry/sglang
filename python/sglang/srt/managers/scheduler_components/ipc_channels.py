@@ -13,6 +13,30 @@ if TYPE_CHECKING:
     )
 
 
+def rpc_scheduler_binds(rpc_ipc_name: str) -> bool:
+    """Which end of the rpc channel binds its endpoint.
+
+    Without DP attention, PortArgs.init_new names the endpoint ipc://<temporary
+    file>, new for each launch, so the scheduler binds it and the Engine connects.
+    Under launch_server no Engine binds it. A scheduler that connected to the
+    unbound endpoint retried at the ZeroMQ reconnect interval for the lifetime of
+    the server, and each retry opens and closes a socket. With DP attention,
+    PortArgs.init_new names a tcp endpoint from the host and the rpc port. Every DP
+    group shares it, so the Engine keeps binding it.
+    """
+    return rpc_ipc_name.startswith("ipc://")
+
+
+def engine_rpc_socket(context: zmq.Context, port_args: PortArgs) -> zmq.Socket:
+    """The Engine's end of the rpc channel, the counterpart of the scheduler's."""
+    return get_zmq_socket(
+        context,
+        zmq.DEALER,
+        port_args.rpc_ipc_name,
+        not rpc_scheduler_binds(port_args.rpc_ipc_name),
+    )
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SchedulerIpcChannels:
     recv_from_tokenizer: Union[zmq.Socket, "ScriptedTokenizerRecvProxy"]
@@ -46,7 +70,10 @@ class SchedulerIpcChannels:
                     underlying=recv_from_tokenizer
                 )
             recv_from_rpc = get_zmq_socket(
-                context, zmq.DEALER, port_args.rpc_ipc_name, False
+                context,
+                zmq.DEALER,
+                port_args.rpc_ipc_name,
+                rpc_scheduler_binds(port_args.rpc_ipc_name),
             )
 
             send_to_tokenizer_raw = get_zmq_socket(
