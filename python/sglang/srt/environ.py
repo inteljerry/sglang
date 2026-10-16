@@ -1293,6 +1293,10 @@ class Envs:
 
     # Distributed
     SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
+    # XPU: a TP all-reduce of a [T, ...] tensor with 1 <= T <= this value runs as one
+    # all-gather and one local fp32 sum in rank order. 0 disables it. The result can
+    # differ in the last bits from the all-reduce.
+    SGLANG_OPT_XPU_AG_ALLREDUCE_MAX_TOKENS = EnvInt(0)
     SGLANG_SHARED_EXPERT_TP1 = EnvBool(False)
     # Replicate the input embedding across TP ranks instead of sharding it
     # along the vocab dimension (saves an all-reduce/all-gather in the embed
