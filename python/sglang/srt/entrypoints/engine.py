@@ -93,6 +93,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     run_multi_detokenizer_router_process,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.scheduler_components.ipc_channels import engine_rpc_socket
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
@@ -120,7 +121,6 @@ from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_free_port,
-    get_zmq_socket,
     is_port_available,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -279,9 +279,7 @@ class Engine(EngineScoreMixin, EngineBase):
         # Initialize ZMQ sockets
         context = zmq.Context(2)
         if self.server_args.node_rank == 0:
-            self.send_to_rpc = get_zmq_socket(
-                context, zmq.DEALER, self.port_args.rpc_ipc_name, True
-            )
+            self.send_to_rpc = engine_rpc_socket(context, self.port_args)
         else:
             self.send_to_rpc = None
 
