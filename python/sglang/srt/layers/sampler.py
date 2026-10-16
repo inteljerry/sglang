@@ -67,6 +67,32 @@ _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
 
+def _min_needs_all_gather(device_type: str) -> bool:
+    """On 8 XPU ranks, all_reduce(ReduceOp.MIN) through xccl was observed to return
+    the sum. XPU therefore takes the minimum of an all_gather. Every other device
+    keeps all_reduce."""
+    return device_type == "xpu"
+
+
+def _all_gather_min_(token_ids: torch.Tensor, group: dist.ProcessGroup) -> None:
+    """Set token_ids to the element-wise minimum over the ranks of the group."""
+    gathered = torch.empty(
+        (dist.get_world_size(group=group), *token_ids.shape),
+        dtype=token_ids.dtype,
+        device=token_ids.device,
+    )
+    dist.all_gather_into_tensor(gathered, token_ids, group=group)
+    torch.amin(gathered, dim=0, out=token_ids)
+
+
+def _all_reduce_min_(token_ids: torch.Tensor, group: dist.ProcessGroup) -> None:
+    """Set token_ids to the element-wise minimum over the ranks of the group."""
+    if _min_needs_all_gather(token_ids.device.type):
+        _all_gather_min_(token_ids, group)
+    else:
+        dist.all_reduce(token_ids, op=dist.ReduceOp.MIN, group=group)
+
+
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
@@ -501,11 +527,7 @@ class Sampler(nn.Module):
             # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
             # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
 
-            torch.distributed.all_reduce(
-                batch_next_token_ids,
-                op=dist.ReduceOp.MIN,
-                group=self.tp_sync_group,
-            )
+            _all_reduce_min_(batch_next_token_ids, self.tp_sync_group)
 
     def compute_logprobs_only(
         self,
