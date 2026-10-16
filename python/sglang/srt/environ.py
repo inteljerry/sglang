@@ -353,6 +353,10 @@ class Envs:
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
+    # XPU. Device memory in MiB that the caching allocator leaves free for allocations
+    # made outside it. 0 (default) sets no cap. Take the value from a measurement of
+    # the tightest rank.
+    SGLANG_OPT_XPU_DEVICE_HEADROOM_MB = EnvInt(0)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
