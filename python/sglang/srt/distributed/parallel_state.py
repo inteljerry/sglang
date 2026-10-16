@@ -44,6 +44,7 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.distributed.device_communicators import xpu_ag_allreduce
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -659,6 +660,10 @@ class GroupCoordinator:
             # _all_reduce_in_place, which for XPU falls through to
             # torch.distributed.all_reduce on self.device_group (the same group
             # used by xpu_communicator).
+            if xpu_ag_allreduce.use_all_gather_sum(input_, self.world_size):
+                return xpu_ag_allreduce.all_gather_sum_(
+                    input_, self.world_size, self.all_gather_into_tensor
+                )
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
