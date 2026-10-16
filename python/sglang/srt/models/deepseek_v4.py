@@ -214,6 +214,12 @@ def _get_mhc_ops() -> MhcOps:
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+_XPU_UNPADDED_HEADS_DECODE = (
+    _is_xpu and envs.SGLANG_OPT_XPU_DSV4_UNPADDED_HEADS_DECODE.get()
+)
+_XPU_UNPADDED_HEADS_PREFILL = (
+    _is_xpu and envs.SGLANG_OPT_XPU_DSV4_UNPADDED_HEADS_PREFILL.get()
+)
 _MHC_POST_MULT_VALUE = 2.0
 
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
@@ -350,7 +356,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
 @register_custom_op(mutates_args=["output"])
@@ -402,6 +408,33 @@ def deepseek_v4_attention_with_output(
 bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
     deepseek_v4_attention_with_output
 )
+
+
+def _use_unpadded_heads(
+    forward_mode: ForwardMode,
+    attn_tp_size: int,
+    n_local_heads: int,
+    *,
+    decode: bool,
+    prefill: bool,
+) -> bool:
+    """Whether the sparse attention call takes the heads of this rank without padding.
+
+    The padding to 64 heads exists for CUDA FlashMLA, which specializes h_q only in
+    {64, 128}. decode covers ForwardMode.DECODE, and prefill covers the extend modes
+    without speculative decoding (EXTEND, MIXED, SPLIT_PREFILL, DLLM_EXTEND). Other
+    modes, a single attention TP rank, more than 64 local heads and a head count that
+    is not a multiple of 8 keep the padded path. The XPU sparse kernels fuse 8 heads
+    per workgroup and reject other counts (the num_heads % 8 checks of
+    mla_sparse_decode.cpp and mla_sparse_prefill.cpp in sgl-kernel-xpu).
+    """
+    if attn_tp_size <= 1 or n_local_heads > 64 or n_local_heads % 8:
+        return False
+    if forward_mode.is_decode():
+        return decode
+    if forward_mode.is_extend_without_speculative():
+        return prefill
+    return False
 
 
 class MqaAttentionBase(nn.Module):
@@ -585,6 +618,11 @@ class MqaAttentionBase(nn.Module):
             sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
             self._attn_sink_local = sink
         return self._attn_sink_local
+
+    def _local_attn_sink_unpadded(self) -> torch.Tensor:
+        """The attn_sink entries of this rank, one per local head, as a view."""
+        start = self.attn_tp_rank * self.n_local_heads
+        return self.attn_sink[start : start + self.n_local_heads]
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
@@ -1216,7 +1254,14 @@ class MQALayer(MqaAttentionBase):
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
-        if self.attn_tp_size > 1:
+        unpadded_heads = _use_unpadded_heads(
+            forward_batch.forward_mode,
+            self.attn_tp_size,
+            self.n_local_heads,
+            decode=_XPU_UNPADDED_HEADS_DECODE,
+            prefill=_XPU_UNPADDED_HEADS_PREFILL,
+        )
+        if self.attn_tp_size > 1 and not unpadded_heads:
             # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
@@ -1232,7 +1277,11 @@ class MQALayer(MqaAttentionBase):
                 q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
-        attn_sink = self._local_attn_sink()
+        attn_sink = (
+            self._local_attn_sink_unpadded()
+            if unpadded_heads
+            else self._local_attn_sink()
+        )
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
