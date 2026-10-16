@@ -60,6 +60,7 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
@@ -70,12 +71,14 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     resolve_ragged_verify_layout,
 )
+from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
 
+    from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
@@ -89,6 +92,36 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+
+
+def write_sequential_c4_indices(
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    topk: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """What topk_transform_512 writes for a row whose length is at most topk: the
+    page-mapped indices of positions 0..len-1 in order, -1 after. The scores do not
+    enter, so this runs without them. Static shapes only (graph capturable)."""
+    rows, width = out_page_indices.shape
+    pos = torch.arange(width, device=out_page_indices.device, dtype=torch.int32)
+    pos = pos.unsqueeze(0)
+    lens = seq_lens.reshape(-1)[:rows].to(torch.int32)
+    if lens.shape[0] < rows:
+        lens = F.pad(lens, (0, rows - lens.shape[0]), value=0)
+    valid = (pos < lens.unsqueeze(1)) & (pos < topk)
+    page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
+    pages = page_table[:rows]
+    page_idx = torch.clamp(pos >> page_bits, max=pages.shape[1] - 1).expand(rows, -1)
+    physical = torch.gather(pages, dim=1, index=page_idx.long()).to(torch.int32)
+    indices = (physical << page_bits) | (pos & (page_size - 1))
+    out_page_indices.copy_(torch.where(valid, indices, torch.full_like(indices, -1)))
+    if out_raw_indices is not None:
+        out_raw_indices.copy_(
+            torch.where(valid, pos.expand(rows, -1), torch.full_like(indices, -1))
+        )
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -490,6 +523,7 @@ class DeepseekV4AttnBackend(
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
+    _skip_redundant_indexer: bool = False
 
     def __init__(
         self,
@@ -525,6 +559,11 @@ class DeepseekV4AttnBackend(
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.c4_topk = getattr(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
+        )
+        # Opt-in, XPU only: skip the C4 indexer scoring in graphs of width at most
+        # 4 * index_topk (see _indexer_scoring_redundant).
+        self._skip_redundant_indexer = (
+            _is_xpu and envs.SGLANG_OPT_DSV4_SKIP_REDUNDANT_INDEXER.get()
         )
 
         self.enable_deepseek_v4_fp4_indexer: bool = (
@@ -1154,6 +1193,8 @@ class DeepseekV4AttnBackend(
                 metadata.core_attn_metadata.swa_page_indices = swa_page_indices
                 metadata.core_attn_metadata.swa_topk_lengths = swa_topk_lengths
 
+        self._init_sequential_c4_indices(forward_batch)
+
     def _dspark_seq_lens_casual(
         self, *, seq_lens: torch.Tensor, block_size: int
     ) -> torch.Tensor:
@@ -1161,6 +1202,93 @@ class DeepseekV4AttnBackend(
             seq_lens=seq_lens,
             block_size=block_size,
             device=self.cuda_int32_kwargs["device"],
+        )
+
+    def _indexer_scoring_redundant(
+        self, forward_batch: ForwardBatch, index_topk: int
+    ) -> bool:
+        """True only while capturing a decode graph whose width W satisfies
+        W <= 4 * index_topk, where W is MAX_SEQ_LEN_FOR_CAPTURE. Every batch that
+        replays that graph has sequences of at most W tokens, hence at most
+        index_topk compressed entries per row, and top-k then keeps all of them
+        whatever the scores are. Eager forwards never skip: the capture width does
+        not bound their sequences."""
+        return (
+            self._skip_redundant_indexer
+            and forward_batch.forward_mode.is_decode()
+            and get_is_capture_mode()
+            and self.MAX_SEQ_LEN_FOR_CAPTURE <= 4 * index_topk
+            and not self.debug_use_external_c4_sparse_indices
+            and self.hisparse_coordinator is None
+            and get_global_indexer_capturer() is None
+        )
+
+    def _init_sequential_c4_indices(self, forward_batch: ForwardBatch) -> None:
+        """In a graph where the C4 indexer scoring is redundant, every C4 layer
+        would write the same in-order page indices from the same per-forward
+        metadata into the one shared buffer. Write them once here, before the first
+        layer, instead of once per layer."""
+        metadata = self.forward_metadata
+        if (
+            not self._skip_redundant_indexer
+            or not isinstance(metadata, DSV4Metadata)
+            or metadata.indexer_metadata is None
+            or forward_batch.forward_mode.is_idle()
+            or not self._indexer_scoring_redundant(forward_batch, self.c4_topk)
+        ):
+            return
+        core_metadata = metadata.core_attn_metadata
+        indexer_metadata = metadata.indexer_metadata
+        write_sequential_c4_indices(
+            indexer_metadata.c4_seq_lens,
+            indexer_metadata.page_table,
+            core_metadata.c4_sparse_page_indices,
+            indexer_metadata.c4_page_size,
+            self.c4_topk,
+            core_metadata.c4_sparse_raw_indices,
+        )
+
+    def forward_c4_indexer(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        c4_indexer: C4Indexer,
+        forward_batch: ForwardBatch,
+        alt_streams: Optional[List[torch.cuda.Stream]] = None,
+        enable_multi_stream: bool = False,
+        q_lora_ready: Optional[torch.cuda.Event] = None,
+        skip_compressor: bool = False,
+    ) -> None:
+        if (
+            self._skip_redundant_indexer
+            and not forward_batch.forward_mode.is_idle()
+            and self._indexer_scoring_redundant(forward_batch, c4_indexer.index_topk)
+        ):
+            # Top-k keeps every compressed entry of every row this graph serves, so
+            # the scores cannot change the selection: skip the query and weight
+            # projections, the logits and the top-k. The compressor still runs; it
+            # writes the index KV rows that later, longer steps score. The in-order
+            # page indices top-k would keep are the same in every C4 layer and were
+            # written once for this forward by init_forward_metadata_in_graph.
+            core_metadata = self.forward_metadata.core_metadata
+            n = min(x.shape[0], q_lora.shape[0], core_metadata.positions.shape[0])
+            if not skip_compressor:
+                self.forward_indexer_compressor(
+                    x=x[:n],
+                    forward_batch=forward_batch,
+                    layer_id=c4_indexer.layer_id,
+                    compressor=c4_indexer.compressor,
+                )
+            return
+        return super().forward_c4_indexer(
+            x=x,
+            q_lora=q_lora,
+            c4_indexer=c4_indexer,
+            forward_batch=forward_batch,
+            alt_streams=alt_streams,
+            enable_multi_stream=enable_multi_stream,
+            q_lora_ready=q_lora_ready,
+            skip_compressor=skip_compressor,
         )
 
     def init_forward_metadata_out_graph(
