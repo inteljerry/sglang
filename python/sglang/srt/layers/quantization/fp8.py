@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 
+import functools
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -162,6 +163,69 @@ _is_xpu = is_xpu()
 
 # Off by default, so the block-scaled path stays the default and the two can be compared.
 _xpu_fp8_to_bf16_gemm = get_bool_env_var("XPU_FP8_TO_BF16_GEMM")
+
+
+@functools.cache
+def _xpu_moe_decode_gemv_op() -> Optional[Callable[..., torch.Tensor]]:
+    """sgl_kernel.moe_w4a16_decode_gemv, or None when sgl_kernel has no such op.
+
+    The cache logs the warning for a missing op once, not once per MoE layer.
+    """
+    try:
+        from sgl_kernel import moe_w4a16_decode_gemv
+    except ImportError:
+        logger.warning(
+            "SGLANG_OPT_XPU_MOE_DECODE_GEMV is set, but sgl_kernel has no "
+            "moe_w4a16_decode_gemv. MoE decode batches run fused_experts."
+        )
+        return None
+    log_info_on_rank0(
+        logger, "MoE: small MXFP4 decode batches run moe_w4a16_decode_gemv."
+    )
+    return moe_w4a16_decode_gemv
+
+
+def _xpu_moe_decode_gemv_eligible(
+    layer: Module,
+    x: torch.Tensor,
+    topk_output: tuple,
+    moe_runner_config: MoeRunnerConfig,
+    max_tokens: int,
+) -> bool:
+    """True when this MXFP4 MoE call is a decode batch that moe_w4a16_decode_gemv takes.
+
+    The checks follow the documented limits of the op: contiguous bf16 activations,
+    T * topk <= 64, topk 6 or 8, an intermediate size per partition of 256 or 512, a
+    hidden size that is a multiple of 512, 16-byte aligned x, w13 and w2, a positive
+    swiglu_limit and no biases. They use shapes, dtypes, alignment and the config
+    only, so a captured graph keeps one choice.
+    """
+    topk_weights, topk_ids, _ = topk_output
+    num_tokens, hidden = x.shape
+    topk = topk_ids.shape[1]
+    return (
+        0 < num_tokens <= max_tokens
+        and topk in (6, 8)
+        and num_tokens * topk <= 64
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and layer.w13_weight.data_ptr() % 16 == 0
+        and layer.w2_weight.data_ptr() % 16 == 0
+        and topk_ids.dtype in (torch.int32, torch.int64)
+        and topk_weights.dtype in (torch.float32, torch.bfloat16)
+        and hidden % 512 == 0
+        and layer.w13_weight.shape[1] // 2 in (256, 512)
+        and moe_runner_config.activation == "silu"
+        and moe_runner_config.swiglu_limit is not None
+        and moe_runner_config.swiglu_limit > 0
+        and moe_runner_config.gemm1_alpha is None
+        and not moe_runner_config.no_combine
+        # the bias parameters exist only when create_weights gets with_bias
+        and getattr(layer, "w13_weight_bias", None) is None
+        and getattr(layer, "w2_weight_bias", None) is None
+    )
+
 
 DSV4_DEQUANT_FP4_TABLE = torch.tensor(
     [
@@ -1116,6 +1180,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
+        self.xpu_moe_decode_gemv = (
+            _xpu_moe_decode_gemv_op()
+            if _is_xpu and envs.SGLANG_OPT_XPU_MOE_DECODE_GEMV.get()
+            else None
+        )
+        self.xpu_moe_decode_gemv_max_tokens = (
+            envs.SGLANG_OPT_XPU_MOE_DECODE_GEMV_MAX_TOKENS.get()
+        )
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
@@ -2441,6 +2513,29 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             use_fp8_w8a8 = layer.w13_weight.dtype == torch.float8_e4m3fn
             use_mxfp4_w4a16 = layer.w13_weight.dtype == torch.int8
             assert self.is_fp4_expert == use_mxfp4_w4a16
+            if (
+                self.xpu_moe_decode_gemv is not None
+                and use_mxfp4_w4a16
+                and _xpu_moe_decode_gemv_eligible(
+                    layer,
+                    x,
+                    dispatch_output.topk_output,
+                    moe_runner_config,
+                    self.xpu_moe_decode_gemv_max_tokens,
+                )
+            ):
+                output = self.xpu_moe_decode_gemv(
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights,
+                    topk_ids,
+                    w1_scale=layer.w13_weight_scale_inv,
+                    w2_scale=layer.w2_weight_scale_inv,
+                    routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+                    swiglu_limit=moe_runner_config.swiglu_limit,
+                )
+                return StandardCombineInput(hidden_states=output)
             output = fused_experts(
                 x,
                 layer.w13_weight,
