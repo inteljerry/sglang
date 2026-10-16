@@ -1199,6 +1199,10 @@ class Envs:
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.
     SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
+    # XPU only. In a decode graph captured at a width of at most 4 * index_topk
+    # tokens, every row has at most index_topk C4 entries and top-k keeps all of
+    # them, so skip the indexer scoring and write the in-order indices instead.
+    SGLANG_OPT_DSV4_SKIP_REDUNDANT_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
