@@ -97,6 +97,9 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.hardware_backend.xpu.device_headroom import (
+    apply_xpu_device_headroom_from_env,
+)
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -4968,6 +4971,9 @@ def run_scheduler_process(
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
+
+        # After the pools and the graphs exist, and before the event loop starts.
+        apply_xpu_device_headroom_from_env(gpu_id)
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
